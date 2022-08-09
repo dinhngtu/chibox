@@ -2,257 +2,173 @@
 #define NOMINMAX
 #include <Windows.h>
 #include <sddl.h>
+#include <atlsecurity.h>
 
 #include <cstdlib>
+#include <stdexcept>
 #include <system_error>
 #include <vector>
 #include <format>
 #include <iostream>
 
+static void PrintToken(const CAccessToken& token) {
+    CTokenGroups tg{};
+    if (!token.GetGroups(&tg)) {
+        throw std::system_error(GetLastError(), std::system_category(), "token.GetGroups");
+    }
+    CSid::CSidArray sids;
+    CAcl::CAccessMaskArray attributes;
+    tg.GetSidsAndAttributes(&sids, &attributes);
+    for (DWORD i = 0; i < tg.GetCount(); i++) {
+        std::wcout << std::format(L"{} {:#x}\n", sids[i].Sid(), attributes[i]);
+    }
+    CTokenPrivileges privs{};
+    if (!token.GetPrivileges(&privs)) {
+        throw std::system_error(GetLastError(), std::system_category(), "token.GetPrivileges");
+    }
+    CTokenPrivileges::CNames privNames{};
+    privs.GetNamesAndAttributes(&privNames);
+    std::wcout << "Privs: ";
+    for (size_t i = 0; i < privNames.GetCount(); i++) {
+        std::wcout << privNames[i].GetString() << " ";
+    }
+    std::wcout << "\n\n";
+}
+
 int main() {
     // get my token and its token groups
-
-    HANDLE pt;
-    if (!OpenProcessToken(
-        GetCurrentProcess(),
-        //TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY | TOKEN_WRITE,
-        TOKEN_ALL_ACCESS,
-        &pt)) {
-        throw std::system_error(GetLastError(), std::system_category(), "OpenProcessToken");
+    CAccessToken myToken{};
+    //TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY | TOKEN_WRITE,
+    if (!myToken.GetProcessToken(TOKEN_ALL_ACCESS)) {
+        throw std::system_error(GetLastError(), std::system_category(), "myToken.GetProcessToken");
     }
 
-    DWORD tgs = 0;
-    if (!GetTokenInformation(pt, TokenGroups, nullptr, 0, &tgs) && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-        throw std::system_error(GetLastError(), std::system_category(), "GetTokenInformation");
-    }
-    auto tg = static_cast<PTOKEN_GROUPS>(calloc(1, tgs));
-    if (!tg) {
-        throw std::bad_alloc();
-    }
-    if (!GetTokenInformation(pt, TokenGroups, tg, tgs, &tgs)) {
-        throw std::system_error(GetLastError(), std::system_category(), "GetTokenInformation");
-    }
+    std::wcout << L"myToken:\n";
+    PrintToken(myToken);
 
-    // deny non-session enabled groups
-
-    SID_AND_ATTRIBUTES usersSid{};
-    DWORD userss = SECURITY_MAX_SID_SIZE;
-    usersSid.Sid = calloc(1, userss);
-    if (!usersSid.Sid) {
-        throw std::bad_alloc();
+    // deny non-session enabled groups and privs
+    CTokenGroups myGroups{};
+    if (!myToken.GetGroups(&myGroups)) {
+        throw std::system_error(GetLastError(), std::system_category(), "myToken.GetGroups");
     }
-    if (!CreateWellKnownSid(WinBuiltinUsersSid, nullptr, usersSid.Sid, &userss)) {
-        throw std::system_error(GetLastError(), std::system_category(), "CreateWellKnownSid");
-    }
-
-    std::vector<SID_AND_ATTRIBUTES> deny{};
-    for (DWORD i = 0; i < tg->GroupCount; i++) {
-        auto& g = tg->Groups[i];
-        LPWSTR sid = nullptr;
-        if (!ConvertSidToStringSidW(g.Sid, &sid)) {
-            throw std::system_error(GetLastError(), std::system_category(), "ConvertSidToStringSidW");
-        }
-        std::wcout << std::format(L"{} {:#x}", sid, g.Attributes);
-        if ((g.Attributes & SE_GROUP_ENABLED) && !(g.Attributes & SE_GROUP_LOGON_ID)) {
-            std::wcout << "*\n";
-            deny.push_back(g);
-        }
-        else {
-            std::wcout << "\n";
+    CTokenGroups deny{};
+    {
+        CSid::CSidArray sids;
+        CAcl::CAccessMaskArray attributes;
+        myGroups.GetSidsAndAttributes(&sids, &attributes);
+        for (DWORD i = 0; i < myGroups.GetCount(); i++) {
+            if ((attributes[i] & SE_GROUP_ENABLED) && !(attributes[i] & SE_GROUP_LOGON_ID)) {
+                deny.Add(sids[i], attributes[i]);
+            }
         }
     }
+    CTokenPrivileges denyPrivs{};
+    myToken.GetPrivileges(&denyPrivs);
 
-    // create restricted token
-
-    SID_AND_ATTRIBUTES nullSid{};
-    DWORD nss = SECURITY_MAX_SID_SIZE;
-    nullSid.Sid = calloc(1, nss);
-    if (!nullSid.Sid) {
-        throw std::bad_alloc();
-    }
-    if (!CreateWellKnownSid(WinNullSid, nullptr, nullSid.Sid, &nss)) {
-        throw std::system_error(GetLastError(), std::system_category(), "CreateWellKnownSid");
+    CAccessToken lockdownToken{};
+    if (!myToken.CreateRestrictedToken(&lockdownToken, deny, CTokenGroups{}, denyPrivs)) {
+        throw std::system_error(GetLastError(), std::system_category(), "myToken.CreateRestrictedToken lockdownToken");
     }
 
-    HANDLE rt;
-    if (!CreateRestrictedToken(
-        pt,
-        DISABLE_MAX_PRIVILEGE,
-        static_cast<DWORD>(deny.size()),
-        deny.data(),
-        0,
-        nullptr,
-        0,
-        nullptr,
-        &rt)) {
-        throw std::system_error(GetLastError(), std::system_category(), "CreateRestrictedToken");
+    // set lockdown token as untrusted
+    CTokenGroups _untrusted;
+    {
+        CSid untrustedSid{ SID_IDENTIFIER_AUTHORITY SECURITY_MANDATORY_LABEL_AUTHORITY, 1, SECURITY_MANDATORY_UNTRUSTED_RID };
+        _untrusted.Add(untrustedSid, 0);
     }
-
-    // create untrusted label
-
-    TOKEN_MANDATORY_LABEL untrustedLabel{};
-    DWORD uss = SECURITY_MAX_SID_SIZE;
-    untrustedLabel.Label.Sid = calloc(1, uss);
-    if (!untrustedLabel.Label.Sid) {
-        throw std::bad_alloc();
-    }
-    if (!CreateWellKnownSid(WinUntrustedLabelSid, nullptr, untrustedLabel.Label.Sid, &uss)) {
-        throw std::system_error(GetLastError(), std::system_category(), "CreateWellKnownSid");
-    }
-
+    TOKEN_MANDATORY_LABEL untrustedLabel{ _untrusted.GetPTOKEN_GROUPS()->Groups[0] };
     if (!SetTokenInformation(
-        rt,
+        lockdownToken.GetHandle(),
         TokenIntegrityLevel,
         &untrustedLabel,
         sizeof(untrustedLabel))) {
-        throw std::system_error(GetLastError(), std::system_category(), "SetTokenInformation");
+        throw std::system_error(GetLastError(), std::system_category(), "SetTokenInformation lockdownToken");
     }
 
-    // print group info of restricted token
+    std::wcout << L"lockdownToken:\n";
+    PrintToken(lockdownToken);
 
-    {
-        std::wcout << "\n\nProcess token:\n";
-        DWORD rtgs = 0;
-        if (!GetTokenInformation(rt, TokenGroups, nullptr, 0, &rtgs) && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-            throw std::system_error(GetLastError(), std::system_category(), "GetTokenInformation");
-        }
-        auto rtg = static_cast<PTOKEN_GROUPS>(calloc(1, rtgs));
-        if (!rtg) {
-            throw std::bad_alloc();
-        }
-        if (!GetTokenInformation(rt, TokenGroups, rtg, rtgs, &rtgs)) {
-            throw std::system_error(GetLastError(), std::system_category(), "GetTokenInformation");
-        }
+    // create the initial token
 
-        for (DWORD i = 0; i < rtg->GroupCount; i++) {
-            auto& g = rtg->Groups[i];
-            LPWSTR sid = nullptr;
-            if (!ConvertSidToStringSidW(g.Sid, &sid)) {
-                throw std::system_error(GetLastError(), std::system_category(), "ConvertSidToStringSidW");
-            }
-            std::wcout << std::format(L"{} {:#x}\n", sid, g.Attributes);
-        }
+    CAccessToken initialToken{};
+    if (!myToken.CreateRestrictedToken(&initialToken, CTokenGroups{}, CTokenGroups{}, denyPrivs)) {
+        throw std::system_error(GetLastError(), std::system_category(), "myToken.CreateRestrictedToken initialToken");
     }
-
-    // create the "unrestricted" token
-
-    HANDLE ut;
-    if (!CreateRestrictedToken(
-        pt,
-        0,
-        0,
-        nullptr,
-        0,
-        nullptr,
-        0,
-        nullptr,
-        &ut)) {
-        throw std::system_error(GetLastError(), std::system_category(), "CreateRestrictedToken");
-    }
-
     if (!SetTokenInformation(
-        ut,
+        initialToken.GetHandle(),
         TokenIntegrityLevel,
         &untrustedLabel,
         sizeof(untrustedLabel))) {
-        throw std::system_error(GetLastError(), std::system_category(), "SetTokenInformation");
+        throw std::system_error(GetLastError(), std::system_category(), "SetTokenInformation initialToken");
     }
 
-    // print
-
-    {
-        std::wcout << "\n\nInitial token:\n";
-        DWORD utgs = 0;
-        if (!GetTokenInformation(ut, TokenGroups, nullptr, 0, &utgs) && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-            throw std::system_error(GetLastError(), std::system_category(), "GetTokenInformation");
-        }
-        auto utg = static_cast<PTOKEN_GROUPS>(calloc(1, utgs));
-        if (!utg) {
-            throw std::bad_alloc();
-        }
-        if (!GetTokenInformation(ut, TokenGroups, utg, utgs, &utgs)) {
-            throw std::system_error(GetLastError(), std::system_category(), "GetTokenInformation");
-        }
-
-        for (DWORD i = 0; i < utg->GroupCount; i++) {
-            auto& g = utg->Groups[i];
-            LPWSTR sid = nullptr;
-            if (!ConvertSidToStringSidW(g.Sid, &sid)) {
-                throw std::system_error(GetLastError(), std::system_category(), "ConvertSidToStringSidW");
-            }
-            std::wcout << std::format(L"{} {:#x}\n", sid, g.Attributes);
-        }
-    }
+    std::wcout << L"initialToken:\n";
+    PrintToken(initialToken);
 
     // setup ipc pipe
-
-    PSECURITY_DESCRIPTOR psd;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        //L"O:S-1-5-21-3101083011-792334776-4041739814-1001G:WDD:(A;;GRGW;;;WD)S:(ML;;NRNW;;;S-1-16-0)",
-        L"D:(A;;GRGW;;;WD)S:(ML;;NRNW;;;S-1-16-0)",
-        SDDL_REVISION,
-        &psd,
-        nullptr)) {
-        throw std::system_error(GetLastError(), std::system_category(), "ConvertStringSecurityDescriptorToSecurityDescriptorW");
+    HANDLE _mine, _yours;
+    CSecurityAttributes pipeAttr{};
+    {
+        CSecurityDesc pipeDesc{};
+        if (!pipeDesc.FromString(L"D:(A;;GRGW;;;WD)S:(ML;;NRNW;;;S-1-16-0)")) {
+            throw std::system_error(GetLastError(), std::system_category(), "pipeDesc.FromString");
+        }
+        pipeDesc.MakeSelfRelative();
+        pipeAttr.Set(pipeDesc, true);
     }
-
-    HANDLE mine, yours;
-    SECURITY_ATTRIBUTES psa{};
-    psa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    psa.lpSecurityDescriptor = psd;
-    psa.bInheritHandle = TRUE;
-    if (!CreatePipe(&mine, &yours, &psa, 0)) {
+    if (!CreatePipe(&_mine, &_yours, &pipeAttr, 0)) {
         throw std::system_error(GetLastError(), std::system_category(), "CreatePipe");
     }
+    CHandle mine(_mine), yours(_yours);
 
     // spawn
-
-    STARTUPINFO si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = INVALID_HANDLE_VALUE;
-    si.hStdOutput = yours;
-    si.hStdError = INVALID_HANDLE_VALUE;
-    PROCESS_INFORMATION pi{};
-    auto cmdline = _wcsdup(L"\"chiboxcp.exe\"");
-    if (!CreateProcessAsUserW(
-        rt,
-        nullptr,
-        cmdline,
-        nullptr,
-        nullptr,
-        TRUE,
-        CREATE_SUSPENDED,
-        nullptr,
-        nullptr,
-        &si,
-        &pi)) {
-        throw std::system_error(GetLastError(), std::system_category(), "CreateProcessAsUserW");
+    CHandle hProcess{}, hThread{};
+    {
+        LPVOID eb;
+        if (!CreateEnvironmentBlock(&eb, nullptr, FALSE)) {
+            throw std::system_error(GetLastError(), std::system_category(), "CreateEnvironmentBlock");
+        }
+        STARTUPINFO si{};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = INVALID_HANDLE_VALUE;
+        si.hStdOutput = yours;
+        si.hStdError = INVALID_HANDLE_VALUE;
+        PROCESS_INFORMATION pi{};
+        std::wstring cmdline(L"\"chiboxcp.exe\"");
+        // we make our own env block so we need to use CPAU manually
+        if (!CreateProcessAsUserW(
+            lockdownToken.Detach(),
+            nullptr,
+            cmdline.data(),
+            nullptr,
+            nullptr,
+            TRUE,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            eb,
+            nullptr,
+            &si,
+            &pi)) {
+            throw std::system_error(GetLastError(), std::system_category(), "lockdownToken.CreateProcessAsUserW");
+        }
+        DestroyEnvironmentBlock(eb);
+        yours.Close();
+        if (!pi.hProcess || !pi.hThread) {
+            throw std::runtime_error("invalid process info handles");
+        }
+        hProcess.Attach(pi.hProcess);
+        hThread.Attach(pi.hThread);
     }
-    free(cmdline);
-    CloseHandle(yours);
 
-    // set child thread to unrestricted token
-
-    HANDLE it;
-    if (!DuplicateTokenEx(
-        ut,
-        TOKEN_ALL_ACCESS,
-        nullptr,
-        SecurityImpersonation,
-        TokenImpersonation,
-        &it)) {
-        throw std::system_error(GetLastError(), std::system_category(), "DuplicateToken");
+    CAccessToken threadToken{};
+    initialToken.CreateImpersonationToken(&threadToken);
+    if (!threadToken.Impersonate(hThread)) {
+        throw std::system_error(GetLastError(), std::system_category(), "initialToken.Impersonate");
     }
-
-    if (!SetThreadToken(&pi.hThread, it)) {
-        throw std::system_error(GetLastError(), std::system_category(), "SetThreadToken");
-    }
-    CloseHandle(it);
 
     // resume and communicate
 
-    if (!ResumeThread(pi.hThread)) {
+    if (!ResumeThread(hThread)) {
         throw std::system_error(GetLastError(), std::system_category(), "ResumeThread");
     }
 
@@ -261,8 +177,6 @@ int main() {
     while (ReadFile(mine, buf.data(), buf.size() * sizeof(wchar_t), &r, nullptr) && r) {
         std::wcout.write(buf.data(), r / sizeof(wchar_t));
     }
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
+    WaitForSingleObject(hProcess, INFINITE);
     return 0;
 }
