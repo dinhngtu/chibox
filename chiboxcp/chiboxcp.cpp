@@ -9,8 +9,17 @@
 #include <string>
 
 int main(int argc, char** argv) {
-    Sleep(5000);
     HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY policy{};
+    policy.DisallowWin32kSystemCalls = 1;
+    if (!SetProcessMitigationPolicy(ProcessSystemCallDisablePolicy, &policy, sizeof(policy))) {
+        auto desc = std::string(std::system_error(GetLastError(), std::system_category(), "SetProcessMitigationPolicy").what());
+        auto wdesc = std::wstring(desc.begin(), desc.end());
+        WriteFile(out, wdesc.data(), wdesc.size() * sizeof(wchar_t), nullptr, nullptr);
+    }
+
+    //Sleep(5000);
     if (!RevertToSelf()) {
         WriteFile(out, L"cannot revert\n", sizeof(L"cannot revert\n"), nullptr, nullptr);
         ExitProcess(1);
@@ -28,6 +37,7 @@ int main(int argc, char** argv) {
         WriteFile(out, buf.data(), r, nullptr, nullptr);
     }
     CloseHandle(f);
-    Sleep(30000);
+    //Sleep(30000);
+    Sleep(INFINITE);
     return 0;
 }
