@@ -1,15 +1,7 @@
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <Windows.h>
-#include <sddl.h>
-#include <atlsecurity.h>
+#include "stdafx.h"
+#include "secutil.h"
 
-#include <cstdlib>
-#include <stdexcept>
-#include <system_error>
-#include <vector>
-#include <format>
-#include <iostream>
+static const chibox::TokenMandatoryLabel UntrustedLabel(MandatoryLevelUntrusted), LowLabel(MandatoryLevelLow);
 
 static void PrintToken(const CAccessToken& token) {
     CTokenGroups tg{};
@@ -32,6 +24,34 @@ static void PrintToken(const CAccessToken& token) {
     for (size_t i = 0; i < privNames.GetCount(); i++) {
         std::wcout << privNames[i].GetString() << " ";
     }
+    std::wcout << "\n";
+    if (token.IsTokenRestricted()) {
+        std::wcout << "Restricted:\n";
+        DWORD rtgs;
+        if (!GetTokenInformation(
+            token.GetHandle(),
+            TokenRestrictedSids,
+            nullptr,
+            0,
+            &rtgs) && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            throw std::system_error(GetLastError(), std::system_category(), "GetTokenInformation");
+        }
+        auto rtg = static_cast<PTOKEN_GROUPS>(calloc(1, rtgs));
+        if (!rtg) {
+            throw std::bad_alloc{};
+        }
+        if (!GetTokenInformation(
+            token.GetHandle(),
+            TokenRestrictedSids,
+            rtg,
+            rtgs,
+            &rtgs)) {
+            throw std::system_error(GetLastError(), std::system_category(), "GetTokenInformation");
+        }
+        for (size_t i = 0; i < rtg->GroupCount; i++) {
+            std::wcout << std::format(L"{} {:#x}\n", CSid(static_cast<SID*>(rtg->Groups[i].Sid)).Sid(), rtg->Groups[i].Attributes);
+        }
+    }
     std::wcout << "\n\n";
 }
 
@@ -46,42 +66,48 @@ int main() {
     std::wcout << L"myToken:\n";
     PrintToken(myToken);
 
+    CSid myUserSid{};
+    myToken.GetUser(&myUserSid);
+
     // deny non-session enabled groups and privs
     CTokenGroups myGroups{};
     if (!myToken.GetGroups(&myGroups)) {
         throw std::system_error(GetLastError(), std::system_category(), "myToken.GetGroups");
     }
     CTokenGroups deny{};
+    CSid myLogonSid{};
     {
         CSid::CSidArray sids;
         CAcl::CAccessMaskArray attributes;
         myGroups.GetSidsAndAttributes(&sids, &attributes);
         for (DWORD i = 0; i < myGroups.GetCount(); i++) {
-            if ((attributes[i] & SE_GROUP_ENABLED) && !(attributes[i] & SE_GROUP_LOGON_ID)) {
+            if (!(attributes[i] & SE_GROUP_ENABLED)) {
+                continue;
+            }
+            if (attributes[i] & SE_GROUP_LOGON_ID) {
+                myLogonSid = sids[i];
+            }
+            else {
                 deny.Add(sids[i], attributes[i]);
             }
         }
     }
+    if (!myLogonSid.IsValid()) {
+        throw std::runtime_error("cannot find logon session sid");
+    }
     CTokenPrivileges denyPrivs{};
     myToken.GetPrivileges(&denyPrivs);
 
+    CTokenGroups restricts{};
+    restricts.Add(Sids::Null(), 0);
+
     CAccessToken lockdownToken{};
-    if (!myToken.CreateRestrictedToken(&lockdownToken, deny, CTokenGroups{}, denyPrivs)) {
+    if (!myToken.CreateRestrictedToken(&lockdownToken, deny, restricts, denyPrivs)) {
         throw std::system_error(GetLastError(), std::system_category(), "myToken.CreateRestrictedToken lockdownToken");
     }
 
     // set lockdown token as untrusted
-    CTokenGroups _untrusted;
-    {
-        CSid untrustedSid{ SID_IDENTIFIER_AUTHORITY SECURITY_MANDATORY_LABEL_AUTHORITY, 1, SECURITY_MANDATORY_UNTRUSTED_RID };
-        _untrusted.Add(untrustedSid, 0);
-    }
-    TOKEN_MANDATORY_LABEL untrustedLabel{ _untrusted.GetPTOKEN_GROUPS()->Groups[0] };
-    if (!SetTokenInformation(
-        lockdownToken.GetHandle(),
-        TokenIntegrityLevel,
-        &untrustedLabel,
-        sizeof(untrustedLabel))) {
+    if (!UntrustedLabel.assign(lockdownToken)) {
         throw std::system_error(GetLastError(), std::system_category(), "SetTokenInformation lockdownToken");
     }
 
@@ -90,15 +116,20 @@ int main() {
 
     // create the initial token
 
+    CTokenGroups initialRestricts{};
+    //initialRestricts.Add(Sids::Users(), 0);
+    initialRestricts.Add(Sids::World(), 0);
+    //initialRestricts.Add(Sids::Interactive(), 0);
+    //initialRestricts.Add(Sids::AuthenticatedUser(), 0);
+    initialRestricts.Add(Sids::RestrictedCode(), 0);
+    //initialRestricts.Add(myUserSid, 0);
+    //initialRestricts.Add(myLogonSid, 0);
+
     CAccessToken initialToken{};
-    if (!myToken.CreateRestrictedToken(&initialToken, CTokenGroups{}, CTokenGroups{}, denyPrivs)) {
+    if (!myToken.CreateRestrictedToken(&initialToken, CTokenGroups{}, initialRestricts, denyPrivs)) {
         throw std::system_error(GetLastError(), std::system_category(), "myToken.CreateRestrictedToken initialToken");
     }
-    if (!SetTokenInformation(
-        initialToken.GetHandle(),
-        TokenIntegrityLevel,
-        &untrustedLabel,
-        sizeof(untrustedLabel))) {
+    if (!UntrustedLabel.assign(initialToken)) {
         throw std::system_error(GetLastError(), std::system_category(), "SetTokenInformation initialToken");
     }
 
@@ -106,20 +137,24 @@ int main() {
     PrintToken(initialToken);
 
     // setup ipc pipe
-    HANDLE _mine, _yours;
-    CSecurityAttributes pipeAttr{};
+    CHandle mine{}, yours{};
     {
+        HANDLE _mine, _yours;
         CSecurityDesc pipeDesc{};
-        if (!pipeDesc.FromString(L"D:(A;;GRGW;;;WD)S:(ML;;NRNW;;;S-1-16-0)")) {
-            throw std::system_error(GetLastError(), std::system_category(), "pipeDesc.FromString");
+        CDacl pipeDacl{};
+        pipeDacl.AddAllowedAce(myLogonSid, GENERIC_READ | GENERIC_WRITE);
+        pipeDesc.SetDacl(pipeDacl);
+        CSecurityAttributes pipeAttr{ pipeDesc, true };
+        if (!CreatePipe(&_mine, &_yours, &pipeAttr, 0)) {
+            throw std::system_error(GetLastError(), std::system_category(), "CreatePipe");
         }
-        pipeDesc.MakeSelfRelative();
-        pipeAttr.Set(pipeDesc, true);
+        mine.Attach(_mine);
+        yours.Attach(_yours);
     }
-    if (!CreatePipe(&_mine, &_yours, &pipeAttr, 0)) {
-        throw std::system_error(GetLastError(), std::system_category(), "CreatePipe");
-    }
-    CHandle mine(_mine), yours(_yours);
+    std::wcout << std::format(
+        L"mine {:#x} yours {:#x} (closing)\n",
+        reinterpret_cast<size_t>((HANDLE)mine),
+        reinterpret_cast<size_t>((HANDLE)yours));
 
     // spawn
     CHandle hProcess{}, hThread{};
@@ -133,7 +168,7 @@ int main() {
         si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdInput = INVALID_HANDLE_VALUE;
         si.hStdOutput = yours;
-        si.hStdError = INVALID_HANDLE_VALUE;
+        si.hStdError = yours;
         PROCESS_INFORMATION pi{};
         std::wstring cmdline(L"\"chiboxcp.exe\"");
         // we make our own env block so we need to use CPAU manually
@@ -178,5 +213,10 @@ int main() {
         std::wcout.write(buf.data(), r / sizeof(wchar_t));
     }
     WaitForSingleObject(hProcess, INFINITE);
+    DWORD cpx;
+    if (!GetExitCodeProcess(hProcess, &cpx)) {
+        throw std::system_error(GetLastError(), std::system_category(), "GetExitCodeProcess");
+    }
+    std::wcout << std::format(L"cp exited {}", cpx);
     return 0;
 }

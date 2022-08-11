@@ -5,39 +5,62 @@
 #include <system_error>
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <vector>
 #include <string>
+#include <format>
+#include <io.h>
+#include <fcntl.h>
+
+static void writestr(HANDLE h, const std::wstring& s) {
+    /*
+    if (!WriteFile(h, s.data(), s.size() * sizeof(wchar_t), nullptr, nullptr)) {
+        ExitProcess(99);
+    }
+    */
+    std::wcout << s;
+}
+
+static void throwmessage(HANDLE h, const std::string& msg, DWORD errcode = GetLastError(), DWORD exitcode = 1) {
+    auto desc = std::string(std::system_error(errcode, std::system_category(), msg).what());
+    auto wdesc = std::wstring(desc.begin(), desc.end());
+    wdesc += L"\n";
+    writestr(h, wdesc);
+    //Sleep(INFINITE);
+    ExitProcess(exitcode);
+}
 
 int main(int argc, char** argv) {
+    setlocale(LC_ALL, ".1200");
+    _setmode(_fileno(stdout), _O_WTEXT);
     HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    std::wcout << std::unitbuf;
 
     PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY policy{};
     policy.DisallowWin32kSystemCalls = 1;
     if (!SetProcessMitigationPolicy(ProcessSystemCallDisablePolicy, &policy, sizeof(policy))) {
-        auto desc = std::string(std::system_error(GetLastError(), std::system_category(), "SetProcessMitigationPolicy").what());
-        auto wdesc = std::wstring(desc.begin(), desc.end());
-        WriteFile(out, wdesc.data(), wdesc.size() * sizeof(wchar_t), nullptr, nullptr);
+        throwmessage(out, "SetProcessMitigationPolicy");
     }
 
-    //Sleep(5000);
+    //Sleep(30000);
     if (!RevertToSelf()) {
-        WriteFile(out, L"cannot revert\n", sizeof(L"cannot revert\n"), nullptr, nullptr);
-        ExitProcess(1);
+        throwmessage(out, "RevertToSelf");
     }
-    WriteFile(out, L"hello world\n", sizeof(L"hello world\n"), nullptr, nullptr);
-    HANDLE f = CreateFile(L"E:/fuck.txt", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    writestr(out, L"hello world\n");
+    HANDLE f = CreateFileW(L"E:/fuck.txt", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    writestr(out, std::format(L"out {:#x} f {:#x}\n", reinterpret_cast<size_t>(out), reinterpret_cast<size_t>(f)));
     if (f == INVALID_HANDLE_VALUE) {
-        auto desc = std::string(std::system_error(GetLastError(), std::system_category(), "CreateFile").what());
-        auto wdesc = std::wstring(desc.begin(), desc.end());
-        WriteFile(out, wdesc.data(), wdesc.size() * sizeof(wchar_t), nullptr, nullptr);
+        throwmessage(out, "CreateFileW");
     }
     std::vector<wchar_t> buf(1024);
     DWORD r;
     while (ReadFile(f, buf.data(), buf.size() * sizeof(wchar_t), &r, nullptr) && r) {
-        WriteFile(out, buf.data(), r, nullptr, nullptr);
+        if (!WriteFile(out, buf.data(), r, nullptr, nullptr)) {
+            throwmessage(out, "WriteFile");
+        }
     }
-    CloseHandle(f);
     //Sleep(30000);
     Sleep(INFINITE);
+    CloseHandle(f);
     return 0;
 }
