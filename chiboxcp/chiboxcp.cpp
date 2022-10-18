@@ -30,9 +30,7 @@ static void throwmessage(HANDLE h, const std::string& msg, DWORD errcode = GetLa
     ExitProcess(exitcode);
 }
 
-int main(int argc, char** argv) {
-    setlocale(LC_ALL, ".1200");
-    _setmode(_fileno(stdout), _O_WTEXT);
+int wmain(int argc, wchar_t** argv) {
     HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
     std::wcout << std::unitbuf;
 

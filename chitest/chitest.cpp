@@ -3,6 +3,18 @@
 
 static const chibox::TokenMandatoryLabel UntrustedLabel(MandatoryLevelUntrusted), LowLabel(MandatoryLevelLow);
 
+static std::wstring DumpObjectSecurityDescriptor(HANDLE h, SE_OBJECT_TYPE objectType, SECURITY_INFORMATION requestedInfo = 31) {
+    CSecurityDesc desc{};
+    if (!AtlGetSecurityDescriptor(h, objectType, &desc, requestedInfo)) {
+        throw std::system_error(GetLastError(), std::system_category(), "AtlGetSecurityDescriptor");
+    }
+    CString sddl{};
+    if (!desc.ToString(&sddl, requestedInfo)) {
+        throw std::system_error(GetLastError(), std::system_category(), "desc.ToString");
+    }
+    return std::wstring(sddl.GetString());
+}
+
 static void PrintToken(const CAccessToken& token) {
     CTokenGroups tg{};
     if (!token.GetGroups(&tg)) {
@@ -19,12 +31,14 @@ static void PrintToken(const CAccessToken& token) {
         throw std::system_error(GetLastError(), std::system_category(), "token.GetPrivileges");
     }
     CTokenPrivileges::CNames privNames{};
-    privs.GetNamesAndAttributes(&privNames);
-    std::wcout << "Privs: ";
-    for (size_t i = 0; i < privNames.GetCount(); i++) {
-        std::wcout << privNames[i].GetString() << " ";
+    CTokenPrivileges::CAttributes privAttrs{};
+    privs.GetNamesAndAttributes(&privNames, &privAttrs);
+    if (privNames.GetCount()) {
+        std::wcout << "Privs:\n";
+        for (size_t i = 0; i < privNames.GetCount(); i++) {
+            std::wcout << std::format(L"{} {:#x}\n", privNames[i].GetString(), privAttrs[i]);
+        }
     }
-    std::wcout << "\n";
     if (token.IsTokenRestricted()) {
         std::wcout << "Restricted:\n";
         DWORD rtgs;
@@ -55,10 +69,16 @@ static void PrintToken(const CAccessToken& token) {
     std::wcout << "\n\n";
 }
 
-int main() {
+int wmain() {
     // get my token and its token groups
     CAccessToken myToken{};
-    //TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY | TOKEN_WRITE,
+    /*
+     * TOKEN_ASSIGN_PRIMARY: CreateProcessAsUserW on lockdown token
+     * TOKEN_DUPLICATE: CreateRestrictedToken, CreateProcessAsUserW
+     * TOKEN_IMPERSONATE: SetThreadToken on initial token
+     * TOKEN_QUERY: CreateProcessAsUserW
+     * TOKEN_WRITE: SetTokenInformation on restricted tokens
+     */
     if (!myToken.GetProcessToken(TOKEN_ALL_ACCESS)) {
         throw std::system_error(GetLastError(), std::system_category(), "myToken.GetProcessToken");
     }
@@ -139,13 +159,16 @@ int main() {
     // setup ipc pipe
     CHandle mine{}, yours{};
     {
+        // D:(A;;GRGW;;;WD)S:(ML;;NRNW;;;S-1-16-0)
+
         HANDLE _mine, _yours;
         CSecurityDesc pipeDesc{};
         CDacl pipeDacl{};
         pipeDacl.AddAllowedAce(myLogonSid, GENERIC_READ | GENERIC_WRITE);
         pipeDesc.SetDacl(pipeDacl);
         CSecurityAttributes pipeAttr{ pipeDesc, true };
-        if (!CreatePipe(&_mine, &_yours, &pipeAttr, 0)) {
+
+        if (!CreatePipe(&_mine, &_yours, nullptr, 0)) {
             throw std::system_error(GetLastError(), std::system_category(), "CreatePipe");
         }
         mine.Attach(_mine);
